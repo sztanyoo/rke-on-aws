@@ -1,0 +1,222 @@
+---
+- name: Create EC2 hosts
+  hosts:
+    - localhost
+  gather_facts: no
+  become: no
+  tasks:
+    - amazon.aws.ec2_group:
+        name: allow_all
+        description: Allow all incoming traffic
+        rules:
+          - proto: tcp
+            from_port: 22
+            to_port: 22
+            cidr_ip: 0.0.0.0/0
+            rule_desc: allow ssh
+          - proto: tcp
+            from_port: 80
+            to_port: 80
+            cidr_ip: 0.0.0.0/0
+            rule_desc: allow http
+          - proto: tcp
+            from_port: 443
+            to_port: 443
+            cidr_ip: 0.0.0.0/0
+            rule_desc: allow https
+          - proto: tcp
+            from_port: 3443
+            to_port: 3444
+            cidr_ip: 0.0.0.0/0
+            rule_desc: allow rancher ports
+          - proto: all
+            from_port: 0
+            to_port: 65535
+            group_name: allow_all
+            rule_desc: allow all internal traffic
+        rules_egress:
+          - proto: all
+            from_port: 0
+            to_port: 65535
+            cidr_ip: 0.0.0.0/0
+            rule_desc: allow outgoing traffic
+    - set_fact:
+        available_hosts: 0
+    - name: Get the number of available nodes
+      set_fact:
+        available_hosts: "{{ groups['role_rkenode']|length }}"
+      when: '"role_rkenode" in groups'
+    - amazon.aws.ec2:
+        key_name: rkeec2user
+        group:
+          - allow_all
+          - allow_outgoing
+        instance_type: t2.medium
+        image: ami-00e87074e52e6c9f9
+        wait: yes
+        wait_timeout: 500
+        count: "{{ 3 - available_hosts }}"
+        instance_tags:
+          Role: rkenode
+        monitoring: yes
+        vpc_subnet_id: subnet-90e1849e
+        assign_public_ip: yes
+        region: us-east-1
+      register: ec2
+      when: not groups["role_rkenode"] is defined or (groups["role_rkenode"]|length < 3)
+    - name: Wait for SSH to come up
+      delegate_to: "{{ item.public_dns_name }}"
+      wait_for_connection:
+        delay: 10
+        timeout: 320
+      loop: "{{ ec2.instances }}"
+      when: not groups["role_rkenode"] is defined or (groups["role_rkenode"]|length < 3)
+
+    - meta: refresh_inventory
+
+- name: Install rke prerequisites on all hosts
+  hosts:
+    - role_rkenode
+  gather_facts: yes
+  become: yes
+  tasks:
+    - name: Install packages
+      yum:
+        name:
+          - wget
+          - docker
+          - python-docker
+        update_cache: yes
+    - name: Start and enable docker
+      systemd:
+        name: docker
+        state: started
+        enabled: yes
+    - name: Create docker group
+      group:
+        name: docker
+    - name: Add centos user to docker group
+      user:
+        user: centos
+        groups:
+          - centos
+          - adm
+          - systemd-journal
+          - docker
+    - name: Give docker socker to docker group
+      file:
+        path: /var/run/docker.sock
+        group: docker
+    - name: Check if kubectl is installed
+      stat:
+        path: /usr/local/bin/kubectl
+      register: kubectl_installed
+    - name: Get kubectl
+      command: curl -LO "https://dl.k8s.io/release/v1.21.1/bin/linux/amd64/kubectl"
+      when: not kubectl_installed.stat.exists
+    - name: Install kubectl
+      command: install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+      when: not kubectl_installed.stat.exists
+    - name: Check if rke is installed
+      stat:
+        path: /usr/local/bin/rke
+      register: rke_installed
+    - name: Get rke
+      command: curl -LO https://github.com/rancher/rke/releases/download/v1.2.8/rke_linux-amd64
+      when: not rke_installed.stat.exists
+    - name: Install rke
+      command: install -o root -g root -m 0755 rke_linux-amd64 /usr/local/bin/rke
+      when: not rke_installed.stat.exists
+
+
+- name: Configure ssh pubkey on lead node
+  hosts:
+    - role_rkenode[0]
+  gather_facts: yes
+  become: no
+  tasks:
+    - name: Check if ssh key exists for the cluster
+      stat:
+        path: /home/centos/.ssh/id_rsa
+      register: rke_sshkey
+    - name: Generate ssh key for rke cluster internal access
+      command: ssh-keygen -t rsa -f /home/centos/.ssh/id_rsa -q -N ""
+      when: not rke_sshkey.stat.exists
+    - name: Set cluster ssh key access permissions
+      file:
+        path: /home/centos/.ssh/id_rsa
+        mode: '0600'
+      when: not rke_sshkey.stat.exists
+    - name: Get pubkey info
+      slurp:
+        src: /home/centos/.ssh/id_rsa.pub
+      register: rke_sshpubkey
+    - name: Set pubkey info to all hosts
+      set_fact:
+        rke_sskpubkeydata: "{{ rke_sshpubkey['content'] | b64decode }}"
+
+
+- name: Add ssh pubkey to all nodes
+  hosts:
+    - role_rkenode
+  gather_facts: no
+  become: no
+  tasks:
+    - name: Setting ssh pubkey to hosts
+      debug:
+        msg: "{{ hostvars[groups['role_rkenode'][0]]['rke_sskpubkeydata'] }}"
+    - name: Set ssh key to authorized keys
+      lineinfile:
+        path: /home/centos/.ssh/authorized_keys
+        line: "{{ hostvars[groups['role_rkenode'][0]]['rke_sskpubkeydata'] }}"
+
+
+- name: Configure rke on lead node
+  hosts:
+    - role_rkenode[0]
+  gather_facts: no
+  become: no
+  tasks:
+    - name: Create rke cluster.yml
+      template:
+        src: templates/rke_cluster.yml.j2
+        dest: /home/centos/cluster.yml
+      register: clusteryml
+    - name: Install rke
+      command: /usr/local/bin/rke up > rke.log 2>&1
+      when: clusteryml.changed
+    - name: Create .kube directory
+      file:
+        path: /home/centos/.kube
+        state: directory
+        owner: centos
+        group: centos
+    - name: Set kubeconfig file
+      copy:
+        src: /home/centos/kube_config_cluster.yml
+        dest: /home/centos/.kube/config
+        remote_src: yes
+
+- name: Start Rancher on lead node
+  hosts:
+    - role_rkenode[0]
+  gather_facts: no
+  become: yes
+  tasks:
+    - name: Start Rancher in a Docker container
+      community.docker.docker_container:
+        image: rancher/rancher
+        name: rancher
+        privileged: yes
+        detach: yes
+        restart_policy: unless-stopped
+        ports:
+          - "3443:80"
+          - "3444:443"
+      register: rancher_status
+      until: rancher_status.failed == false
+      retries: 3
+      delay: 10
+    - name: Ranches status
+      debug:
+        msg: "{{ rancher_status }}"
